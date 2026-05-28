@@ -4,6 +4,14 @@ const path = require("node:path");
 
 const PORT = Number(process.env.PORT || 5173);
 const ROOT = __dirname;
+const FALLBACK_IMAGE_PREAMBLE = [
+  "Create forensic suspect composite sketches for investigative review.",
+  "Render exactly one suspect per image.",
+  "Keep the suspect identity consistent across all requested iterations.",
+  "Use a neutral forward-facing pose, neutral expression, and plain background.",
+  "Include visible accessories when reported.",
+  "Do not include badges, text labels, watermarks, weapons, crime-scene elements, dramatic lighting, or multiple people.",
+].join(" ");
 
 async function loadLocalEnv() {
   try {
@@ -23,6 +31,16 @@ async function loadLocalEnv() {
     });
   } catch {
     // .env is optional; production deployments should use real environment vars.
+  }
+}
+
+async function loadImagePreamble() {
+  try {
+    process.env.IMAGE_MODEL_PREAMBLE = (
+      await fs.readFile(path.join(ROOT, "image-preamble.md"), "utf8")
+    ).trim();
+  } catch {
+    process.env.IMAGE_MODEL_PREAMBLE = FALLBACK_IMAGE_PREAMBLE;
   }
 }
 
@@ -74,13 +92,13 @@ function buildRealtimeInstructions(caseProfile, interviewPreamble) {
 }
 
 function buildImagePrompt(prompt, caseProfile) {
+  const imagePreamble = process.env.IMAGE_MODEL_PREAMBLE || FALLBACK_IMAGE_PREAMBLE;
+
   return [
-    prompt,
+    imagePreamble,
     "",
-    "Create a forensic suspect composite sketch for investigative review.",
-    "Render exactly one suspect per image, forward-facing, neutral expression, plain background.",
-    "Do not include badges, police uniforms, text labels, watermarks, weapons, or crime-scene elements.",
-    "Preserve the same identity across requested iterations while varying small sketch interpretation details.",
+    "Case-specific prompt:",
+    prompt,
     "",
     "Shared case schema:",
     JSON.stringify(caseProfile, null, 2),
@@ -196,7 +214,7 @@ async function handleRealtimeCall(request, response) {
             type: "near_field",
           },
           transcription: {
-            model: "gpt-4o-mini-transcribe",
+            model: "whisper-1",
             language: "en",
           },
           turn_detection: {
@@ -301,7 +319,7 @@ const server = http.createServer(async (request, response) => {
   });
 });
 
-loadLocalEnv().then(() => {
+Promise.all([loadLocalEnv(), loadImagePreamble()]).then(() => {
   server.listen(PORT, () => {
     console.log(`Forensics Drawer listening on http://localhost:${PORT}`);
   });

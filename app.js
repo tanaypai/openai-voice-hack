@@ -6,12 +6,21 @@ const state = {
   realtime: null,
   caseSchema: null,
   interviewPreamble: "",
+  interviewTimeoutId: null,
+  wrapUpTimeoutId: null,
 };
 
+const INTERVIEW_LIMIT_MS = 3 * 60 * 1000;
+const INTERVIEW_WRAP_UP_MS = 2.5 * 60 * 1000;
+
 const FALLBACK_INTERVIEW_AGENT_PREAMBLE = [
-  "You are a forensic interview assistant helping a trained investigator collect details for one suspect composite.",
-  "Speak calmly and ask one concise question at a time.",
-  "Only ask about observable physical facial traits useful for a sketch.",
+  "You are the detective conducting a short follow-up interview with a witness for one suspect composite.",
+  "Begin by saying: \"I'm the detective assigned to help create the sketch. I just need a few more details about the person you saw.\"",
+  "The interview is limited to 3 minutes. Ask one concise question at a time.",
+  "At 2 minutes and 30 seconds, begin gracefully wrapping up and ask if there is anything else the witness would like to mention that was not covered.",
+  "At the 3-minute mark, gracefully end by saying: \"Thank you, I have the details I need to create the sketch now.\"",
+  "Do not ask confidence-rating questions. Assume provided details are high confidence unless the witness explicitly says they are unsure.",
+  "Ask about observable facial traits and visible accessories such as eyewear, headwear, scarves, masks, sunglasses, jewelry, scars, or tattoos.",
   "Avoid making demographic inferences beyond what the witness explicitly states.",
   "Always treat the initial suspect profile as context, confirm uncertain details, and refine the profile through witness testimony.",
 ].join(" ");
@@ -37,13 +46,11 @@ const regenerateButton = document.querySelector("#regenerateButton");
 const backToInterviewButton = document.querySelector("#backToInterviewButton");
 
 const summaryFields = [
+  ["gender", "Gender"],
+  ["raceEthnicity", "Race / ethnicity"],
   ["age", "Age range"],
-  ["face", "Face shape"],
-  ["hair", "Hair"],
-  ["eyes", "Eyes"],
-  ["nose", "Nose"],
-  ["facialHair", "Facial hair"],
-  ["mark", "Distinguishing feature"],
+  ["eyeColor", "Eye color"],
+  ["hairColor", "Hair color"],
   ["style", "Composite style"],
 ];
 
@@ -59,13 +66,18 @@ function buildCaseSchema() {
     caseId: form.caseId,
     suspectCount: 1,
     suspect: {
+      genderPresentation: form.gender,
+      raceEthnicity: form.raceEthnicity,
       ageRange: form.age,
-      faceShape: form.face,
-      hair: form.hair,
-      eyes: form.eyes,
-      nose: form.nose,
-      facialHair: form.facialHair,
-      distinguishingFeature: form.mark,
+      eyeColor: form.eyeColor,
+      hairColor: form.hairColor,
+      faceShape: "to be gathered during interview",
+      hair: "to be gathered during interview",
+      eyes: "to be gathered during interview",
+      nose: "to be gathered during interview",
+      facialHair: "to be gathered during interview",
+      distinguishingFeature: "to be gathered during interview",
+      visibleAccessory: "to be gathered during interview",
     },
     generation: {
       style: form.style,
@@ -75,6 +87,7 @@ function buildCaseSchema() {
     interview: {
       voiceModel: form.voiceModel,
       preamble: state.interviewPreamble || FALLBACK_INTERVIEW_AGENT_PREAMBLE,
+      limitSeconds: INTERVIEW_LIMIT_MS / 1000,
       witnessDetails: [...state.details],
     },
   };
@@ -115,13 +128,11 @@ function buildPrompt() {
   return [
     `Create ${caseSchema.generation.iterations} iterations of the same suspect as a ${caseSchema.generation.style}.`,
     `One suspect only; keep identity consistent across iterations.`,
+    `Gender or presentation: ${caseSchema.suspect.genderPresentation}.`,
+    `Race or ethnicity, if witness provided it: ${caseSchema.suspect.raceEthnicity}.`,
     `Age range: ${caseSchema.suspect.ageRange}.`,
-    `Face shape: ${caseSchema.suspect.faceShape}.`,
-    `Hair: ${caseSchema.suspect.hair}.`,
-    `Eyes: ${caseSchema.suspect.eyes}.`,
-    `Nose: ${caseSchema.suspect.nose}.`,
-    `Facial hair: ${caseSchema.suspect.facialHair}.`,
-    `Distinguishing feature: ${caseSchema.suspect.distinguishingFeature}.`,
+    `Eye color: ${caseSchema.suspect.eyeColor}.`,
+    `Hair color: ${caseSchema.suspect.hairColor}.`,
     `Witness interview notes: ${details}.`,
     "Use a neutral forward-facing forensic composition on a plain background.",
   ].join("\n");
@@ -140,13 +151,11 @@ function getImageErrorMessage(status, errorText) {
 function renderSummary() {
   const caseSchema = getCaseSchema();
   const summaryValues = {
+    gender: caseSchema.suspect.genderPresentation,
+    raceEthnicity: caseSchema.suspect.raceEthnicity,
     age: caseSchema.suspect.ageRange,
-    face: caseSchema.suspect.faceShape,
-    hair: caseSchema.suspect.hair,
-    eyes: caseSchema.suspect.eyes,
-    nose: caseSchema.suspect.nose,
-    facialHair: caseSchema.suspect.facialHair,
-    mark: caseSchema.suspect.distinguishingFeature,
+    eyeColor: caseSchema.suspect.eyeColor,
+    hairColor: caseSchema.suspect.hairColor,
     style: caseSchema.generation.style,
   };
 
@@ -345,6 +354,70 @@ function stopRealtimeSession() {
   state.realtime = null;
 }
 
+function clearInterviewTimers() {
+  if (state.interviewTimeoutId) {
+    clearTimeout(state.interviewTimeoutId);
+    state.interviewTimeoutId = null;
+  }
+
+  if (state.wrapUpTimeoutId) {
+    clearTimeout(state.wrapUpTimeoutId);
+    state.wrapUpTimeoutId = null;
+  }
+}
+
+function requestInterviewWrapUp() {
+  const dataChannel = state.realtime?.dataChannel;
+
+  if (!dataChannel || dataChannel.readyState !== "open") {
+    appendTranscript("Detective", "Is there anything else you would like to mention that we haven’t covered?");
+    return;
+  }
+
+  dataChannel.send(
+    JSON.stringify({
+      type: "conversation.item.create",
+      item: {
+        type: "message",
+        role: "user",
+        content: [
+          {
+            type: "input_text",
+            text: "The interview has reached 2 minutes and 30 seconds. Begin wrapping up now. Ask the witness: \"Is there anything else you would like to mention that we haven’t covered?\" Keep it brief.",
+          },
+        ],
+      },
+    }),
+  );
+
+  dataChannel.send(
+    JSON.stringify({
+      type: "response.create",
+      response: {
+        output_modalities: ["audio"],
+      },
+    }),
+  );
+}
+
+function startInterviewTimer() {
+  clearInterviewTimers();
+
+  state.wrapUpTimeoutId = setTimeout(() => {
+    state.wrapUpTimeoutId = null;
+    sessionStatus.textContent = "Wrapping up";
+    appendTranscript("System", "Two minutes and thirty seconds reached. Wrapping up.");
+    requestInterviewWrapUp();
+  }, INTERVIEW_WRAP_UP_MS);
+
+  state.interviewTimeoutId = setTimeout(() => {
+    state.interviewTimeoutId = null;
+    appendTranscript("System", "Three-minute interview limit reached.");
+    appendTranscript("Detective", "Thank you, I have the details I need to create the sketch now.");
+    finishInterview();
+  }, INTERVIEW_LIMIT_MS);
+}
+
 function handleRealtimeEvent(payload) {
   let event;
 
@@ -383,10 +456,18 @@ function handleRealtimeEvent(payload) {
 
 async function startInterview() {
   const caseSchema = getCaseSchema();
+  clearInterviewTimers();
+  stopRealtimeSession();
+  state.live = false;
   caseLabel.textContent = `Case ${caseSchema.caseId}`;
   state.details = [];
   state.caseSchema = getCaseSchema();
   transcript.innerHTML = "";
+  recordButton.classList.remove("live");
+  voiceCard.classList.remove("live");
+  sessionStatus.classList.remove("live");
+  recordLabel.textContent = "Start interview";
+  sessionStatus.textContent = "Ready";
   renderSummary();
   showScreen("interview");
   appendTranscript(
@@ -413,7 +494,9 @@ async function toggleVoice() {
       recordLabel.textContent = "Stop interview";
       sessionStatus.textContent = "Interview live";
       appendTranscript("System", "Realtime interview started.");
+      startInterviewTimer();
     } catch (error) {
+      clearInterviewTimers();
       state.live = false;
       recordButton.classList.remove("live");
       voiceCard.classList.remove("live");
@@ -429,6 +512,7 @@ async function toggleVoice() {
       recordButton.disabled = false;
     }
   } else {
+    clearInterviewTimers();
     stopRealtimeSession();
     recordButton.classList.remove("live");
     voiceCard.classList.remove("live");
@@ -445,7 +529,7 @@ function drawIteration(canvas, variant) {
   const suspect = caseSchema.suspect;
   const width = canvas.width;
   const height = canvas.height;
-  const seed = variant * 19 + suspect.hair.length + suspect.faceShape.length;
+  const seed = variant * 19 + suspect.hairColor.length + suspect.eyeColor.length;
 
   ctx.fillStyle = "#f8f5ef";
   ctx.fillRect(0, 0, width, height);
@@ -466,17 +550,24 @@ function drawIteration(canvas, variant) {
   ctx.fillStyle = "#efe2d3";
   ctx.lineWidth = 4;
 
-  const narrow = suspect.faceShape.includes("narrow") || suspect.faceShape.includes("long");
-  const jaw = suspect.faceShape.includes("square") ? 12 : 0;
-  const faceWidth = narrow ? 68 : 82;
+  const faceWidth = suspect.genderPresentation.includes("female") ? 72 : 82;
+  const jaw = suspect.genderPresentation.includes("male") ? 10 : 0;
 
   ctx.beginPath();
   ctx.ellipse(0, -8, faceWidth + variant * 2, 98 - jaw, 0, 0, Math.PI * 2);
   ctx.fill();
   ctx.stroke();
 
-  ctx.fillStyle = "#25202a";
-  if (!suspect.hair.includes("bald") && !suspect.hair.includes("shaved")) {
+  const hairColor = suspect.hairColor.includes("blond")
+    ? "#b49356"
+    : suspect.hairColor.includes("red")
+      ? "#8b4636"
+      : suspect.hairColor.includes("gray") || suspect.hairColor.includes("white")
+        ? "#9a9a91"
+        : "#25202a";
+
+  ctx.fillStyle = hairColor;
+  if (!suspect.hairColor.includes("unknown")) {
     ctx.beginPath();
     ctx.moveTo(-78, -82);
     ctx.bezierCurveTo(-50, -150, 54, -148, 80, -78);
@@ -493,8 +584,15 @@ function drawIteration(canvas, variant) {
   ctx.quadraticCurveTo(32, -52 + variant, 54, -42);
   ctx.stroke();
 
-  ctx.fillStyle = "#242a33";
-  const eyeOffset = suspect.eyes.includes("close") ? 28 : 38;
+  const eyeColor = suspect.eyeColor.includes("blue")
+    ? "#3b6e95"
+    : suspect.eyeColor.includes("green")
+      ? "#4f7552"
+      : suspect.eyeColor.includes("hazel")
+        ? "#7a5d36"
+        : "#242a33";
+  ctx.fillStyle = eyeColor;
+  const eyeOffset = 34;
   ctx.beginPath();
   ctx.ellipse(-eyeOffset, -24, 10, 6, 0, 0, Math.PI * 2);
   ctx.ellipse(eyeOffset, -24, 10, 6, 0, 0, Math.PI * 2);
@@ -502,7 +600,7 @@ function drawIteration(canvas, variant) {
 
   ctx.strokeStyle = "#6d4d3e";
   ctx.lineWidth = 3;
-  const noseLength = suspect.nose.includes("prominent") ? 40 : 30;
+  const noseLength = 32;
   ctx.beginPath();
   ctx.moveTo(0, -16);
   ctx.lineTo(-8, -16 + noseLength);
@@ -516,22 +614,40 @@ function drawIteration(canvas, variant) {
   ctx.quadraticCurveTo(0, 56 + variant, 36, 42);
   ctx.stroke();
 
-  if (!suspect.facialHair.includes("clean") && !suspect.facialHair.includes("none")) {
-    ctx.fillStyle = "rgba(42, 34, 34, 0.78)";
+  if (suspect.visibleAccessory === "dark sunglasses") {
+    ctx.fillStyle = "rgba(20, 26, 34, 0.88)";
+    ctx.fillRect(-50, -34, 34, 18);
+    ctx.fillRect(16, -34, 34, 18);
+    ctx.strokeStyle = "#1f2835";
+    ctx.lineWidth = 4;
     ctx.beginPath();
-    ctx.moveTo(-48, 34);
-    ctx.quadraticCurveTo(0, 94, 50, 34);
-    ctx.quadraticCurveTo(18, 70, -48, 34);
-    ctx.fill();
+    ctx.moveTo(-16, -25);
+    ctx.lineTo(16, -25);
+    ctx.stroke();
   }
 
-  if (!suspect.distinguishingFeature.includes("none")) {
-    ctx.strokeStyle = "#8f493d";
+  if (suspect.visibleAccessory === "clear eyeglasses") {
+    ctx.strokeStyle = "#1f2835";
     ctx.lineWidth = 3;
+    ctx.strokeRect(-50, -35, 34, 22);
+    ctx.strokeRect(16, -35, 34, 22);
     ctx.beginPath();
-    ctx.moveTo(-46, -58);
-    ctx.lineTo(-26, -48);
+    ctx.moveTo(-16, -24);
+    ctx.lineTo(16, -24);
     ctx.stroke();
+  }
+
+  if (suspect.visibleAccessory === "scarf around neck") {
+    ctx.fillStyle = "#536b7d";
+    ctx.fillRect(-58, 88, 116, 28);
+  }
+
+  if (suspect.visibleAccessory === "baseball cap") {
+    ctx.fillStyle = "#34465a";
+    ctx.beginPath();
+    ctx.ellipse(0, -104, 78, 24, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillRect(-62, -124, 124, 30);
   }
 
   ctx.restore();
@@ -634,6 +750,8 @@ async function generateIterations() {
 }
 
 function finishInterview() {
+  clearInterviewTimers();
+
   if (state.live) {
     state.live = false;
     stopRealtimeSession();
